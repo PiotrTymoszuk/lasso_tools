@@ -7,6 +7,7 @@
   require(tidyverse)
   require(glmnet)
   require(furrr)
+  require(ggrepel)
 
 # globals -----
 
@@ -221,6 +222,7 @@
   
   get_qc_tbl_lasso <- function(cv_object, new_data_tbl, 
                                response, 
+                               transf_fun = NULL, 
                                variables = names(inp_tbl)[names(inp_tbl) != response], 
                                lambda_crit = 'lambda.1se', 
                                type = 'response', ...) {
@@ -228,10 +230,17 @@
     ## a customized wrapper around predict.glmnet that handles data frames
     ## returns predictions, true values and residuals
     
+    if(is.null(transf_fun)) {
+      
+      transf_fun <- function(x) x
+      
+    }
+    
+    
     x <- model.matrix(~ ., 
                       new_data_tbl[, variables])
     
-    true_vals <- new_data_tbl[[response]]
+    true_vals <- transf_fun(new_data_tbl[[response]])
     
     predictions <- predict(object = cv_object, 
                            newx = x, 
@@ -257,8 +266,10 @@
   
   get_qc_plots_lasso <- function(cv_object, new_data_tbl, 
                                  response, 
+                                 transf_fun = NULL, 
                                  variables = names(inp_tbl)[names(inp_tbl) != response], 
-                                 lambda_crit = 'lambda.1se', ...) {
+                                 lambda_crit = 'lambda.1se', 
+                                 type = 'response', ...) {
     
     ## draws standard model qc plots with missfits labeled by obs. numbers
     ## ... are additional arguments passed to get_qc_tbl_lasso()
@@ -269,8 +280,9 @@
                                new_data_tbl = new_data_tbl, 
                                response = response, 
                                variables = variables, 
+                               transf_fun, 
                                lambda_crit = lambda_crit, 
-                               type = 'response')
+                               type = type, ...)
     
     ## QC plots
     
