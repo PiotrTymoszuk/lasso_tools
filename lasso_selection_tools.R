@@ -1,6 +1,8 @@
 # This toolbox script contains functions for LASSO (or other model type provided by glmnet package)
 # modeling taking a data frame as input data and functions used for selection of the optimal variable set
-# based on bootstrap subsets of the given data
+# and inference based on bootstrap subsets of the given data.
+# At the moment, there may be a bit of problem with handling NAs in the input data sets.
+# Please make sure, your input data contain complete observations only
 
 # tools -----
 
@@ -8,6 +10,8 @@
   require(glmnet)
   require(furrr)
   require(ggrepel)
+  require(coxed)
+  require(stringi)
 
 # globals -----
 
@@ -44,9 +48,9 @@
     
     ## creates a series of train/test data sets out of the given table
     ## the size of the training data set can be specified by the user
-    ## for optimal performance and compatibility with the knn prediction
-    ## and accuracy testing functions, a data frame with specified row names
-    ## is required
+    
+    ## if the nrow_train equals to nrow of the input table
+    ## a simple bootstrap is performed
     
     if(is.null(rownames(inp_tbl))) {
       
@@ -56,9 +60,22 @@
     
     tbl_len <- nrow(inp_tbl)
     
-    split_ids <- paste('split', 1:n_splits, sep = '_') %>% 
-      map(function(x) sample(1:tbl_len, nrow_train)) %>% 
-      set_names(paste('split', 1:n_splits, sep = '_'))
+    split_names <- paste('split', 1:n_splits, sep = '_')
+    
+    if(nrow_train < nrow(inp_tbl)) {
+      
+      split_ids <- split_names %>% 
+        map(function(x) sample(1:tbl_len, nrow_train, replace = F))
+      
+    } else {
+      
+      split_ids <- split_names %>% 
+        map(function(x) sample(1:tbl_len, nrow_train, replace = T))
+      
+    }
+    
+    split_ids <- split_ids %>% 
+      set_names(split_names)
     
     split_lst <- split_ids %>% 
       map(function(x) list(train = inp_tbl[x, ], 
@@ -68,58 +85,6 @@
     
 }
 
-  count_occurrence <- function(branched_lst, element) {
-    
-    ## for the given list of vectors with non-repeating elements,
-    ## the occurrence of the given unique vector element in the list
-    ## is returned
-    
-    counting_res <- branched_lst %>% 
-      map(function(x) element %in% x) %>% 
-      reduce(sum)
-    
-    counting_res <- tibble(element = element, 
-                           n = counting_res)
-    
-    return(counting_res)
-    
-}
-
-  make_occurr_plot <- function(count_tbl, cutoff = 0.95, 
-                               plot_title = NULL, plot_subtitle = NULL, plot_tag = NULL) {
-    
-    ## draws a bar plot with the occurrence of the given element
-    
-    count_plot <- count_tbl %>% 
-      mutate(selected = ifelse(frac_models >= cutoff, 
-                               'yes', 
-                               'no')) %>% 
-      ggplot(aes(x = frac_models, 
-                 y = reorder(co_variate, frac_models), 
-                 fill = selected)) + 
-      geom_bar(stat = 'identity', 
-               color = 'black') + 
-      geom_vline(xintercept = cutoff, 
-                 linetype = 'dashed') + 
-      geom_text(aes(label = signif(frac_models, 2)), 
-                size = 2.75, 
-                hjust = 0, 
-                nudge_x = 0.025) + 
-      scale_fill_manual(values = c('no' = 'gray80', 
-                                   'yes' = 'coral3'), 
-                        name = 'Included\nin the best set') + 
-      lasso_globs$common_theme + 
-      theme(axis.title.y = element_blank()) +
-      labs(title = plot_title, 
-           subtitle = plot_subtitle, 
-           tag = plot_tag, 
-           x = 'Fraction of the bootstraps')
-        
-    
-    return(count_plot)
-    
-  } 
-  
   point_plot_ <- function(data, x_var, y_var, x_lab = x_var, y_lab = y_var, 
                           plot_title = NULL, smooth = T, silent = T, ...) {
     
@@ -202,6 +167,10 @@
     
     ## model components
     
+    inp_tbl <- inp_tbl %>% 
+      select(all_of(c(response, variables))) %>% 
+      filter(complete.cases(.))
+    
     y <- inp_tbl[[response]]
     
     x <- model.matrix(~ ., 
@@ -215,6 +184,35 @@
                           alpha = alpha, ...)
     
     return(cv_model)    
+    
+  }
+  
+  model_lasso <- function(inp_tbl, response, variables = names(inp_tbl)[names(inp_tbl) != response], 
+                          family = 'poisson', alpha = 1, ...) {
+    
+    ## a customized wrapped around glmnet() for handling data frames
+    ## categorical covariates are turned into 'dummy' variables by model.matrix()
+    
+    
+    ## model components
+    
+    inp_tbl <- inp_tbl %>% 
+      select(all_of(c(response, variables))) %>% 
+      filter(complete.cases(.))
+    
+    y <- inp_tbl[[response]]
+    
+    x <- model.matrix(~ ., 
+                      inp_tbl[, variables])
+    
+    ## cross-validated model selection
+    
+    net_model <- glmnet(x = x, 
+                        y = y, 
+                        family = family, 
+                        alpha = alpha, ...)
+    
+    return(net_model)    
     
   }
   
@@ -307,21 +305,19 @@
     
   }
   
-# variable selection functions ------
+# bootstrap modeling function ------
   
-  select_var_set_ <- function(boot_tbls, response, 
-                              variables = names(boot_tbls[[1]])[names(boot_tbls[[1]]) != response], 
-                              family = 'poisson', alpha = 1, lambda_crit = 'lambda.1se', 
-                              frac_cutoff = 0.95, .parallel = F, ...) {
+  boot_lasso_ <- function(boot_tbls, response, 
+                          variables = names(boot_tbls[[1]])[names(boot_tbls[[1]]) != response], 
+                          mod_fun = model_lasso, 
+                          family = 'poisson', alpha = 1, lambda_crit = 'lambda.1se',
+                          .parallel = F,  ...) {
     
     ## selects the optimal co-variate pool from the initial set ('variables')
-    ## and the given bootstrap subsets of a table unsing the glmnet() lasso technique. 
+    ## and the given bootstrap subsets of a table using the glmnet() lasso technique. 
     ## Lambda_crit defines a criterion for the variable set selection in each bootstrap
-    ## frac_cutoff defines the minimum fraction of the bootstrap model where the given
     ## co-variate was selected as a criterion for the inclusion in the final co-variate dataset
-    ## Values: the vectors of non-zero co-efficient in the bootstrap models (co-eff selection by lambda_crit), 
-    ## occurrence table with the counts of each unique co-variate within the non-zero co-effcicient set
-    ## occurrence plot and the best variable set selected with the frac_cutoff paramater
+    ## Values: a table of co-efficients in the bootstrap models (co-eff selection by lambda_crit)
     
     start_time <- Sys.time()
     
@@ -338,7 +334,7 @@
       plan('multisession')
       
       res_models <- boot_tbls %>% 
-        future_map(model_cv_lasso, 
+        future_map(mod_fun, 
                    response = response, 
                    variables = variables, 
                    family = family, 
@@ -351,7 +347,7 @@
     } else {
       
       res_models <- boot_tbls %>% 
-        map(model_cv_lasso, 
+        map(mod_fun, 
             response = response, 
             variables = variables, 
             family = family, 
@@ -360,88 +356,35 @@
     }
     
     ## selection of non-zero coefficients
-    ## coefficent names are extracted from the results 
+    ## co-efficent names are extracted from the results 
     ## via a regex made of the input variable vector
     
     coef_lst <- res_models %>% 
       map(coef, 
           s = lambda_crit) %>% 
       map(as.matrix) %>% 
-      map(as.data.frame) %>% 
-      map(function(x) filter(x, x[[1]] != 0)) %>% 
-      map(rownames)
-    
-    extr_regex <- paste(variables, 
-                        collapse = '|')
-    
-    coef_lst <- coef_lst %>% 
-      map(stri_extract, 
-          regex = extr_regex) %>%
-      map(function(x) x[!is.na(x)]) %>% 
-      map(unique)
-    
-    ## counting the occurrence of each unique co-variate in the bootstrap models
-    ## calculating the fraction of all models, where ach of the co-variates was selected
-    
-    all_vars <- coef_lst %>% 
-      reduce(c) %>% 
-      unique
-    
-    occurrence_counts <- all_vars %>% 
-      map_dfr(count_occurrence, 
-              branched_lst = coef_lst) %>% 
-      mutate(n_total = length(coef_lst), 
-             frac_models = n/n_total) %>% 
-      set_names(c('co_variate', 
-                  'n', 
-                  'n_total', 
-                  'frac_models')) %>% 
-      arrange( - frac_models)
-    
-    ## selection of the best set of the co-variates
-    
-    best_cov_set <- occurrence_counts %>% 
-      filter(frac_models >= frac_cutoff) %>% 
-      .$co_variate
-    
-    ## occurrence plot
-    
-    plot_tag = paste('\nBootstraps: n = ', 
-                     length(boot_tbls), 
-                     '\ncutoff = ', 
-                     frac_cutoff, 
-                     '\nbest co-variates: n = ', 
-                     length(best_cov_set), 
-                     '\ninitial co-variate set: n = ', 
-                     length(variables), 
-                     sep = '')
-    
-    occurrence_plot <- occurrence_counts %>% 
-      make_occurr_plot(cutoff = frac_cutoff, 
-                       plot_title = 'Co-variate selection', 
-                       plot_subtitle = 'Co-variate occurrence in the bootstrap models',
-                       plot_tag = plot_tag)
-    
+      map(as.data.frame)
     
     message(paste('Elapsed:', Sys.time() - start_time))
     
-    return(list(coef_lst = coef_lst, 
-                occurrence_counts = occurrence_counts, 
-                occurrence_plot = occurrence_plot, 
-                best_cov_set = best_cov_set))
-    
+    return(coef_lst %>% 
+             map(rownames_to_column, 
+                 'coeff') %>% 
+             map(as_tibble))
+
   }
   
-  select_var_set <- function(inp_tbl, response, 
-                             variables = names(inp_tbl)[names(inp_tbl) != response], 
-                             nrow_boot = floor(nrow(inp_tbl) * 0.8),  n_boots = 100, 
-                             family = 'poisson', alpha = 1, lambda_crit = 'lambda.1se', 
-                             frac_cutoff = 0.95, .parallel = F, seed = NULL, ...) {
+# inference GLM net modeling -----
+  
+  model_boot_lasso <- function(inp_tbl, response, 
+                               variables = names(inp_tbl)[names(inp_tbl) != response], 
+                               nrow_boot = nrow(inp_tbl),  n_boots = 100, 
+                               family = 'poisson', alpha = 1, lambda_crit = 'lambda.1se', 
+                               ci_method = 'BCA', .parallel = F, seed = NULL, ...) {
     
-    ## The key function of the project: selects the optimal variable set
-    ## based on the non-zero estimates of LASSO regression done with the random 
-    ## subsets (bootstrap) of the input data. The optimal co-variate set is finally
-    ## fed into the LASSO model applied to the input data.
+    ## The key function of the project: fits a LASSO model to the data and obtains estimate
+    ## inference statistics (95% CI) by bootstrap. P value for the coeffcients are calculated
+    ## by Wilcoxon test
     ## Arguments:
     ## inp_tbl: input data, ideally with named rows,
     ## response: modeling response, 
@@ -451,8 +394,27 @@
     ## family: glm family
     ## alpha: glmnet alpha parameter
     ## lambda_crit: defines a criterion for the non-zero co-efficient co-variate set selection in each bootstrap
-    ## frac_cutoff: occurrence cutoff for the variable selection from the bootstrap model list
     ## .parallel: should the analysis be run in parallel
+    ## The bootstrap CI may be calculated by BCA (coxed) or percentile method
+    
+    ## fitting to the initial data, obtaining the coefficients and merging with the bootstrap stats
+    
+    final_fit <- model_cv_lasso(inp_tbl = inp_tbl, 
+                                response = response, 
+                                variables = variables, 
+                                family = family, 
+                                alpha = alpha, ...)
+    
+    final_coeffs <- coef(final_fit, lambda_crit) %>% 
+      as.matrix %>% 
+      as.data.frame %>% 
+      rownames_to_column('coeff') %>% 
+      as_tibble %>% 
+      set_names(c('coeff', 'estimate'))
+    
+    ## fixed lambda used for bootstrap models
+    
+    lambda_fix <- final_fit[[lambda_crit]]
     
     ## bootstrap sets
     
@@ -466,37 +428,74 @@
                              nrow_train = nrow_boot, 
                              n_splits = n_boots)
     
-    ## variable selection
+    ## coefficients in the bootstrap models
     
-    var_sel_results <- boot_list %>% 
+    boot_coefs <- boot_list %>% 
       map(function(x) x$train) %>% 
-      select_var_set_(boot_tbls = ., 
-                      response = response, 
-                      variables = variables, 
-                      family = family, 
-                      alpha = alpha, 
-                      lambda_crit = lambda_crit, 
-                      frac_cutoff = frac_cutoff, 
-                      .parallel = .parallel, ...)
+      boot_lasso_(boot_tbls = ., 
+                  response = response, 
+                  variables = variables, 
+                  family = family, 
+                  alpha = alpha, 
+                  lambda_crit = lambda_fix, 
+                  mod_fun = model_lasso, 
+                  .parallel = .parallel, ...)
     
-    ## fitting to the initial data
+    coeff_tbl <- boot_coefs %>% 
+      reduce(left_join, 
+             by = 'coeff') %>% 
+      column_to_rownames('coeff') %>% 
+      t %>% 
+      as_tibble
     
-    final_fit <- model_cv_lasso(inp_tbl = inp_tbl, 
-                                response = response, 
-                                variables = var_sel_results$best_cov_set, 
-                                family = family, 
-                                alpha = alpha)
+    ## obtaining the coefficient bootstrap percentiles and 95% CI by the BCA method provided by coxed
     
-    ## obtaining the model measures: fit, error and pseudo-Rsq
+    if(ci_method == 'BCA') {
+      
+      coeff_stats <- coeff_tbl %>% 
+        map2_dfr(.,
+                 names(.), 
+                 function(x, y) tibble(coeff = y, 
+                                       lower_ci = bca(x)[1], 
+                                       upper_ci = bca(x)[2]))
+      
+    } else {
+      
+      coeff_stats <- coeff_tbl %>% 
+        map2_dfr(.,
+                 names(.), 
+                 function(x, y) tibble(coeff = y, 
+                                       lower_ci = quantile(x, 0.025), 
+                                       upper_ci = quantile(x, 0.975)))
+      
+    }
+    
+    coeff_tests <- coeff_tbl %>% 
+      map(function(x) suppressWarnings(wilcox.test(x))) %>% 
+      map2_dfr(., names(.),
+               function(x, y) tibble(coeff = y, 
+                                     p_value = x$p.value))
+    
+    coef_tbl <- left_join(final_coeffs, 
+                           coeff_stats, 
+                           by = 'coeff') %>% 
+      left_join(coeff_tests, 
+                by = 'coeff') %>% 
+      mutate(response = response)
+    
+    ## obtaining the model measures: n_cases, fit, error and pseudo-Rsq
     
     final_fit_measures <- assess.glmnet(final_fit,
-                                        newx = model.matrix(~., inp_tbl[, var_sel_results$best_cov_set]), 
-                                        newy = psych_lasso$analysis_tbl[[response]], 
+                                        newx = model.matrix(~., inp_tbl[, variables]), 
+                                        newy = inp_tbl[[response]], 
                                         s = lambda_crit)
     
     final_fit_rsq_tbl <- tibble(lambda = final_fit$lambda, 
-                                rsq = 1 - final_fit$cvm/var(psych_lasso$analysis_tbl[[response]])) ## credits to: https://myweb.uiowa.edu/pbreheny/7600/s16/notes/2-22.pdf
+                                rsq = 1 - final_fit$cvm/var(inp_tbl[[response]])) ## credits to: https://myweb.uiowa.edu/pbreheny/7600/s16/notes/2-22.pdf
     
+    final_fit_measures$n <- nrow(inp_tbl)
+    
+    attr(final_fit_measures$n, 'measure') = 'n observations'
     
     final_fit_measures$rsq <- final_fit_rsq_tbl %>% 
       filter(lambda == final_fit[[lambda_crit]]) %>% 
@@ -510,29 +509,27 @@
     
     extr_regex <- paste(variables, 
                         collapse = '|')
-    
-    coef_tbl <- final_fit %>% 
-      coef(s = lambda_crit) %>% 
-      as.matrix %>% 
-      as.data.frame %>% 
-      set_names('estimate')
-    
+
     coef_tbl <- coef_tbl %>% 
-      rownames_to_column('coefficient_name') %>% 
-      mutate(covariate = stri_extract(coefficient_name, 
+      mutate(covariate = stri_extract(coeff, 
                                       regex = extr_regex), 
-             level = stri_replace(coefficient_name, 
+             level = stri_replace(coeff, 
                                   regex = extr_regex, 
-                                  replacement = '')) %>% 
-      as_tibble %>% 
-      select(coefficient_name, 
-             covariate, 
-             level, 
-             estimate) %>%
+                                  replacement = ''), 
+             coefficient_name = coeff)  %>%
       filter(!(stri_detect(coefficient_name, fixed = 'Intercept') & estimate == 0)) %>% 
       mutate(coefficient_name = ifelse(stri_detect(coefficient_name, fixed = 'Intercept'), 
                                        'Intercept', 
-                                       coefficient_name))
+                                       coefficient_name), 
+             response = response) %>% 
+      select(response, 
+             coefficient_name, 
+             covariate, 
+             level, 
+             estimate,  
+             lower_ci, 
+             upper_ci,  
+             p_value)
     
     ## final co-variate set
     
@@ -541,14 +538,15 @@
              estimate != 0) %>% 
       .$covariate %>% 
       unique
- 
+    
     ## output list
     
-    result_list <- c(var_sel_results, 
-                     list(final_fit = final_fit, 
-                          final_fit_measures = final_fit_measures, 
-                          final_fit_coef = coef_tbl, 
-                          final_var_set = final_var_set))
+    result_list <- list(response = response, 
+                        fit = final_fit, 
+                        fit_measures = final_fit_measures, 
+                        fit_coef = coef_tbl, 
+                        final_var_set = final_var_set) 
+                     
     
     return(result_list)
     
