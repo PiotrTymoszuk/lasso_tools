@@ -12,6 +12,7 @@
   require(ggrepel)
   require(coxed)
   require(stringi)
+  require(hdi)
 
 # globals -----
 
@@ -156,6 +157,183 @@
     
   }
   
+  get_estimates_ <- function(linear_model, transf_fun = NULL, 
+                             fallback = F, silent_messages = T, estimate_only = T, ...) {
+    
+    ## extract coefficients from a linear or generalized linear model (betas)
+    ## together with confidence intervals obtained by OLS. The argument trans_fun allows for 
+    ## transformation of the coefficients and CI (e.g. to convert them to OR in logistic regression)
+    ## ... specifies other arguments to the CI-calculating function confint()
+    ## the fallback option: calculates the CI based on the normality assumption: i. e. SEM * critical norm distr
+    
+    ## transforming function
+    
+    if(is.null(transf_fun)) {
+      
+      transf_fun <- function(x) x
+      
+    }
+    
+    ## model summary: to get se and p values
+    
+    mod_summary <- summary(linear_model)
+    
+    ## model estimates, error and CI, transforming
+    
+    model_coefs <- coefficients(linear_model)
+    
+    model_se <- mod_summary$coefficients[, 2]
+    
+    if(estimate_only) {
+      
+      ## returns solely the beta estimates
+      
+     return(tibble(parameter = names(model_coefs), 
+                   estimate = unname(model_coefs), 
+                   p_value = unname(mod_summary$coefficients[, 4])))
+      
+    }
+    
+    if(fallback) {
+      
+      model_ci <- tibble(lower_ci = model_coefs + qnorm(0.025)*model_se, 
+                         upper_ci = model_coefs + qnorm(0.975)*model_se)
+      
+      
+    } else {
+      
+      if(silent_messages) {
+        
+        model_ci <- suppressMessages(confint(linear_model, ...))
+        
+        
+      } else {
+        
+        model_ci <- confint(linear_model, ...)
+        
+      }
+      
+      model_ci <- model_ci %>% 
+        as_tibble %>% 
+        set_names(c('lower_ci', 
+                    'upper_ci'))
+      
+    }
+    
+    
+    
+    est_tibble <- model_ci %>% 
+      mutate(estimate = unname(model_coefs)) %>% 
+      map_dfc(transf_fun) %>% 
+      mutate(parameter = names(model_coefs), 
+             se = unname(model_se)) %>% 
+      select(parameter, 
+             estimate, 
+             se, 
+             lower_ci, 
+             upper_ci)
+    
+    ## p values extracted from model summary
+    ## n number of complete observations extracted from the model frame
+    
+    model_p <- mod_summary$coefficients[, 4]
+    
+    est_tibble <- est_tibble %>% 
+      mutate(p_value = unname(model_p), 
+             n_complete = nrow(model.frame(linear_model)))
+    
+    return(est_tibble)
+    
+  }
+  
+  make_ols_ <- function(inp_data, response, variables, weights, family, error_resistant = T, 
+                        estimate_only = T) {
+    
+    ## fits a (gneralized) linear model to the data using OLS
+    ## returns a table with model estimates
+    
+    
+    if(error_resistant) {
+      
+      mod_formula <- try(paste(response, 
+                               '~', 
+                               paste(variables, collapse = '+')) %>% 
+                           as.formula, 
+                         silent = T)
+      
+      model <- try(glm(formula = mod_formula, 
+                       data = inp_data, 
+                       weights = weights, 
+                       family = 'poisson'), silent = T)
+      
+      est_tbl <- try(get_estimates_(model, 
+                                    estimate_only = estimate_only), 
+                     silent = T)
+      
+      if(any(c(class(model), class(est_tbl), class(mod_formula)) == 'try-error')) {
+        
+        return(NULL)
+        
+      }
+      
+    } else {
+      
+      mod_formula <- paste(response, 
+                           '~', 
+                           paste(variables, collapse = '+')) %>% 
+        as.formula
+      
+      model <- glm(formula = mod_formula, 
+                   data = inp_data, 
+                   weights = weights, 
+                   family = 'poisson')
+      
+      est_tbl <- model %>% 
+        get_estimates_(estimate_only = estimate_only)
+      
+    }
+    
+    return(est_tbl)
+    
+  }
+  
+  lotto_p_ <- function(p_val_vector) {
+    
+    ## aggregates the p value by the quantile method described in http://arxiv.org/abs/1408.4026
+    
+    quant_vec <- seq(0, 1, by = 0.01)
+    
+    corr_p_values <- quant_vec %>% 
+      map_dbl(function(x) quantile(p_val_vector, x)/x)
+    
+    agg_p <- min(corr_p_values)
+    
+    return(agg_p)
+    
+  }
+  
+  test_perm_ <- function(est_sign, est_boots) {
+    
+    ## permutation bootstrap test
+    
+    est_boots <- est_boots[!is.na(est_boots)]
+    
+    greater_zero <- (est_sign*est_boots > 0) %>% 
+      sum
+    
+    p <- (length(est_boots) - greater_zero)/length(est_boots)
+    
+    if(p == 0) {
+      
+      p <- 1/length(est_boots)
+      
+    }
+    
+    return(p)      
+    
+  }
+  
+  
 # glmnet modeling wrapper for data frame input data -----
   
   model_cv_lasso <- function(inp_tbl, response, variables = names(inp_tbl)[names(inp_tbl) != response], 
@@ -218,7 +396,48 @@
   
 # Prediction and QC functions handling the data frame input ------  
   
-  get_qc_tbl_lasso <- function(cv_object, new_data_tbl, 
+  get_measures_cv_lasso <- function(cv_object, 
+                                    new_data_tbl, 
+                                    response, 
+                                    variables, 
+                                    family,
+                                    weights = NULL, 
+                                    lambda_crit = 'lambda.1se') {
+    
+    ## gets basic model goodness measures out of a cv_model
+    
+    fit_measures <- assess.glmnet(cv_object,
+                                  newx = model.matrix(~., new_data_tbl[, variables]), 
+                                  newy = new_data_tbl[[response]], 
+                                  weights = weights, 
+                                  family = family, 
+                                  s = lambda_crit)
+
+    fit_rsq <- model_lasso(inp_tbl = new_data_tbl, 
+                           response = response, 
+                           variables = variables, 
+                           family = family, 
+                           weights = weights)
+    
+    fit_rsq_tbl <- tibble(lambda = fit_rsq$lambda, 
+                          rsq = 1 - fit_rsq$dev.ratio) ## credits to: https://myweb.uiowa.edu/pbreheny/7600/s16/notes/2-22.pdf
+    
+    fit_measures$n <- nrow(new_data_tbl)
+    
+    attr(fit_measures$n, 'measure') = 'n observations'
+    
+    fit_measures$rsq <- fit_rsq_tbl %>% 
+      filter(near(lambda, cv_object[[lambda_crit]])) %>% 
+      .$rsq
+    
+    attr(fit_measures$rsq, 'measure') = 'pseudo R squared'
+    
+    return(fit_measures)
+    
+  }
+  
+  get_qc_tbl_lasso <- function(cv_object, 
+                               new_data_tbl, 
                                response, 
                                transf_fun = NULL, 
                                variables = names(inp_tbl)[names(inp_tbl) != response], 
@@ -243,7 +462,7 @@
     predictions <- predict(object = cv_object, 
                            newx = x, 
                            s = lambda_crit, 
-                           type = type)
+                           type = type, ...)
     
     predictions <- tibble(.rownames = rownames(predictions), 
                           .fitted = predictions[, 1], 
@@ -262,7 +481,8 @@
     
   } 
   
-  get_qc_plots_lasso <- function(cv_object, new_data_tbl, 
+  get_qc_plots_lasso <- function(cv_object, 
+                                 new_data_tbl, 
                                  response, 
                                  transf_fun = NULL, 
                                  variables = names(inp_tbl)[names(inp_tbl) != response], 
@@ -309,8 +529,9 @@
   
   boot_lasso_ <- function(boot_tbls, response, 
                           variables = names(boot_tbls[[1]])[names(boot_tbls[[1]]) != response], 
+                          weights = NULL, 
                           mod_fun = model_lasso, 
-                          family = 'poisson', alpha = 1, lambda_crit = 'lambda.1se',
+                          family = 'poisson', alpha = 1, lambda_crit = 'lambda.1se', seed = NULL, 
                           .parallel = F,  ...) {
     
     ## selects the optimal co-variate pool from the initial set ('variables')
@@ -320,6 +541,12 @@
     ## Values: a table of co-efficients in the bootstrap models (co-eff selection by lambda_crit)
     
     start_time <- Sys.time()
+    
+    if(!is.null(seed)) {
+      
+      set.seed(seed = seed)
+      
+    }
     
     message(paste('Looking for the optimal variable set with '), 
             length(boot_tbls), 
@@ -337,6 +564,7 @@
         future_map(mod_fun, 
                    response = response, 
                    variables = variables, 
+                   weights = weights, 
                    family = family, 
                    alpha = alpha, 
                    .options = furrr_options(seed = T), 
@@ -350,6 +578,7 @@
         map(mod_fun, 
             response = response, 
             variables = variables, 
+            weights = weights,
             family = family, 
             alpha = alpha, ...)
       
@@ -374,17 +603,18 @@
 
   }
   
-# inference GLM net modeling -----
+# Inference GLM net modeling based on bootstrap -----
   
   model_boot_lasso <- function(inp_tbl, response, 
                                variables = names(inp_tbl)[names(inp_tbl) != response], 
+                               weights = NULL, inference = T, 
                                nrow_boot = nrow(inp_tbl),  n_boots = 100, 
                                family = 'poisson', alpha = 1, lambda_crit = 'lambda.1se', 
                                ci_method = 'BCA', .parallel = F, seed = NULL, ...) {
     
-    ## The key function of the project: fits a LASSO model to the data and obtains estimate
-    ## inference statistics (95% CI) by bootstrap. P value for the coeffcients are calculated
-    ## by Wilcoxon test
+    ## The key function of the project: fits a LASSO model to the data and, optionally, obtains estimate
+    ## inference statistics (95% CI) by bootstrap. 
+    ## P value for the coeffcients are calculated by a standard bootstrap test
     ## Arguments:
     ## inp_tbl: input data, ideally with named rows,
     ## response: modeling response, 
@@ -397,13 +627,18 @@
     ## .parallel: should the analysis be run in parallel
     ## The bootstrap CI may be calculated by BCA (coxed) or percentile method
     
+    message(paste('Modeling:', response))
+    
     ## fitting to the initial data, obtaining the coefficients and merging with the bootstrap stats
     
     final_fit <- model_cv_lasso(inp_tbl = inp_tbl, 
                                 response = response, 
                                 variables = variables, 
+                                weights = weights, 
                                 family = family, 
-                                alpha = alpha, ...)
+                                alpha = alpha)
+    
+    ## getting the coeffcient values, variable names and their levels
     
     final_coeffs <- coef(final_fit, lambda_crit) %>% 
       as.matrix %>% 
@@ -411,6 +646,55 @@
       rownames_to_column('coeff') %>% 
       as_tibble %>% 
       set_names(c('coeff', 'estimate'))
+    
+    extr_regex <- paste(variables, 
+                        collapse = '|')
+    
+    final_coeffs <- final_coeffs %>% 
+      mutate(covariate = stri_extract(coeff, 
+                                      regex = extr_regex), 
+             level = stri_replace(coeff, 
+                                  regex = extr_regex, 
+                                  replacement = ''), 
+             coefficient_name = coeff)  %>%
+      filter(!(stri_detect(coefficient_name, fixed = 'Intercept') & estimate == 0)) %>% 
+      mutate(coefficient_name = ifelse(stri_detect(coefficient_name, fixed = 'Intercept'), 
+                                       'Intercept', 
+                                       coefficient_name), 
+             response = response, 
+             n_complete = nrow(inp_tbl))
+    
+    ## obtaining model goodness paramaters
+    
+    final_fit_measures <- get_measures_cv_lasso(cv_object = final_fit, 
+                                                new_data_tbl = inp_tbl, 
+                                                response = response, 
+                                                variables = variables, 
+                                                family = family, 
+                                                weights = weights, 
+                                                lambda_crit = lambda_crit)
+    
+    ## a vector with non-zero coeffcients
+    
+    final_var_set <- final_coeffs %>% 
+      filter(!is.na(covariate), 
+             estimate != 0) %>% 
+      .$covariate %>% 
+      unique
+    
+    if(!inference) {
+      
+      result_list <- list(response = response, 
+                          fit = final_fit, 
+                          fit_measures = final_fit_measures, 
+                          fit_coef = final_coeffs, 
+                          final_var_set = final_var_set) 
+      
+      return(result_list)
+      
+    }
+    
+    ## model inference, be sure, you want it!
     
     ## fixed lambda used for bootstrap models
     
@@ -435,6 +719,7 @@
       boot_lasso_(boot_tbls = ., 
                   response = response, 
                   variables = variables, 
+                  weights = weights, 
                   family = family, 
                   alpha = alpha, 
                   lambda_crit = lambda_fix, 
@@ -470,75 +755,43 @@
       
     }
     
-    coeff_tests <- coeff_tbl %>% 
-      map(function(x) suppressWarnings(wilcox.test(x))) %>% 
-      map2_dfr(., names(.),
-               function(x, y) tibble(coeff = y, 
-                                     p_value = x$p.value))
+    ## calculation of the p value with the classical permutation test
     
+    sign_tbl <- final_coeffs %>% 
+      mutate(est_sign = sign(estimate), 
+             est_boots = coeff_tbl %>% 
+               select(-X.Intercept..1) %>%
+               as.list) %>% 
+      select(coeff, 
+             est_sign, 
+             est_boots)
+    
+    p_boot <- sign_tbl %>% 
+      select(est_sign, 
+             est_boots) %>% 
+      pmap_dbl(test_perm_)
+    
+    sign_tbl <- sign_tbl %>% 
+      mutate(p_boot = p_boot)
+    
+    ## merging
+
     coef_tbl <- left_join(final_coeffs, 
                            coeff_stats, 
                            by = 'coeff') %>% 
-      left_join(coeff_tests, 
+      left_join(sign_tbl, 
                 by = 'coeff') %>% 
-      mutate(response = response)
-    
-    ## obtaining the model measures: n_cases, fit, error and pseudo-Rsq
-    
-    final_fit_measures <- assess.glmnet(final_fit,
-                                        newx = model.matrix(~., inp_tbl[, variables]), 
-                                        newy = inp_tbl[[response]], 
-                                        s = lambda_crit)
-    
-    final_fit_rsq_tbl <- tibble(lambda = final_fit$lambda, 
-                                rsq = 1 - final_fit$cvm/var(inp_tbl[[response]])) ## credits to: https://myweb.uiowa.edu/pbreheny/7600/s16/notes/2-22.pdf
-    
-    final_fit_measures$n <- nrow(inp_tbl)
-    
-    attr(final_fit_measures$n, 'measure') = 'n observations'
-    
-    final_fit_measures$rsq <- final_fit_rsq_tbl %>% 
-      filter(lambda == final_fit[[lambda_crit]]) %>% 
-      .$rsq %>% 
-      set_names('rsq')
-    
-    attr(final_fit_measures$rsq, 'measure') = 'pseudo R squared'
-    
-    ## coefficents of the final fit, obtaining the co_variate names
-    ## and levels with a regex search
-    
-    extr_regex <- paste(variables, 
-                        collapse = '|')
-
-    coef_tbl <- coef_tbl %>% 
-      mutate(covariate = stri_extract(coeff, 
-                                      regex = extr_regex), 
-             level = stri_replace(coeff, 
-                                  regex = extr_regex, 
-                                  replacement = ''), 
-             coefficient_name = coeff)  %>%
-      filter(!(stri_detect(coefficient_name, fixed = 'Intercept') & estimate == 0)) %>% 
-      mutate(coefficient_name = ifelse(stri_detect(coefficient_name, fixed = 'Intercept'), 
-                                       'Intercept', 
-                                       coefficient_name), 
-             response = response) %>% 
+      mutate(response = response) %>% 
       select(response, 
              coefficient_name, 
              covariate, 
              level, 
+             n_complete, 
              estimate,  
              lower_ci, 
              upper_ci,  
-             p_value)
-    
-    ## final co-variate set
-    
-    final_var_set <- coef_tbl %>% 
-      filter(!is.na(covariate), 
-             estimate != 0) %>% 
-      .$covariate %>% 
-      unique
-    
+             p_boot)
+
     ## output list
     
     result_list <- list(response = response, 
@@ -546,10 +799,266 @@
                         fit_measures = final_fit_measures, 
                         fit_coef = coef_tbl, 
                         final_var_set = final_var_set) 
-                     
     
     return(result_list)
     
+  }
+  
+# Inference GLM net modeling based on the sample splitting -------
+
+  model_split_lasso <- function(inp_tbl, response, 
+                                variables = names(inp_tbl)[names(inp_tbl) != response], 
+                                weights = NULL, 
+                                n_boots = 100, 
+                                family = 'poisson', alpha = 1, lambda_crit = 'lambda.1se', 
+                                ci_method = 'BCA', 
+                                .parallel_lasso = F, .parallel_ols = F, seed = NULL, ...) {
+    
+    ## The key function of the project: fits a LASSO model to the data and obtains estimate
+    ## inference statistics (95% CI) is obtained by sample splitting as described at https://arxiv.org/pdf/1408.4026.pdf.
+    ## Arguments:
+    ## inp_tbl: input data, ideally with named rows,
+    ## response: modeling response, 
+    ## variables: vector with the names of the variables included in the initial co-variate pool
+    ## nrow_boot: size of the bootstrap subsets
+    ## n_boots: number of the bootstraps
+    ## family: glm family
+    ## alpha: glmnet alpha parameter
+    ## lambda_crit: defines a criterion for the non-zero co-efficient co-variate set selection in each bootstrap
+    ## .parallel: should the analysis be run in parallel
+    ## The bootstrap CI may be calculated by BCA (coxed) or percentile method
+    
+    message(paste('Modeling:', response))
+    
+    message(paste('Looking for the optimal variable set with '), 
+            n_boots, 
+            ' bootstrap tables')
+    
+    start_time <- Sys.time()
+    
+    ## generating the LASSO (training) and OLS splits (test)
+    
+    if(!is.null(seed)) {
+      
+      set.seed(seed = seed)
+      
+    }
+    
+    nrow_boot <-  floor(nrow(inp_tbl)/2)
+    
+    boot_list <- make_splits(inp_tbl = inp_tbl %>% 
+                               mutate(weights = weights), 
+                             nrow_train = nrow_boot, 
+                             n_splits = n_boots)
+    
+    weight_list <- boot_list %>% 
+      map(function(x) list(train = x$train$weights, 
+                           test = x$test$weights))
+    
+    ## fitting the lasso models to the training splits, extracting the non-zero coefficients
+    
+    if(.parallel_lasso) {
+      
+      plan('multisession')
+      
+      lasso_models <- list(inp_tbl = map(boot_list, function(x) x$train), 
+                           weights = map(weight_list, function(x) x$train)) %>% 
+        future_pmap(model_cv_lasso, 
+                    response = response, 
+                    variables = variables, 
+                    family = family, 
+                    alpha = alpha, 
+                    .options = furrr_options(seed = T), ...)
+      
+      plan('sequential')
+      
+    } else {
+      
+      lasso_models <- list(inp_tbl = map(boot_list, function(x) x$train), 
+                           weights = map(weight_list, function(x) x$train)) %>% 
+        pmap(model_cv_lasso, 
+             response = response, 
+             variables = variables, 
+             family = family, 
+             alpha = alpha, ...)
+      
+    }
+    
+    lasso_coefs <- lasso_models %>% 
+      map(coef, 
+          s = lambda_crit) %>% 
+      map(as.matrix) %>% 
+      map(as.data.frame) %>% 
+      map(set_names, 
+          'coeff') %>% 
+      map(rownames_to_column, 
+          'coeff_name')
+    
+    lasso_non_zero <- lasso_coefs %>% 
+      map(filter, 
+          coeff != 0, 
+          !stri_detect(coeff_name, fixed = 'Intercept')) %>% 
+      map(function(x) x$coeff_name)
+    
+    ## extracting the initial variable names from the list of non-zero estimates
+    
+    extr_regex <- paste(variables, 
+                        collapse = '|')
+    
+    sel_variables <- lasso_non_zero %>% 
+      map(stri_extract, 
+          regex = extr_regex)
+    
+    ## fitting the OLS models to the test halves of the data splits
+    ## with the variable sets selected by LASSO
+    
+    if(.parallel_ols) {
+      
+      plan('multisession')
+      
+      ols_est <- list(inp_data = map(boot_list, function(x) x$test), 
+                      variables = sel_variables, 
+                      weights = map(weight_list, function(x) x$test)) %>% 
+        future_pmap(make_ols_, 
+                    response = response, 
+                    family = family, 
+                    estimate_only = T, 
+                    .options = furrr_options(seed = T))
+      
+      plan('sequential')
+      
+    } else {
+      
+      ols_est <- list(inp_data = map(boot_list, function(x) x$test), 
+                      variables = sel_variables, 
+                      weights = map(weight_list, function(x) x$test)) %>% 
+        pmap(make_ols_, 
+             response = response, 
+             family = family, 
+             estimate_only = T)
+      
+    }
+    
+    ## obtaining the expected value from the bootstrap estimate samples
+    ## and 95%CI: either with the percentile or BCA method
+    
+    est_tbl <- ols_est %>% 
+      compact %>% 
+      map(select, 
+          parameter, 
+          estimate) %>% 
+      reduce(full_join, 
+             by = 'parameter') %>% 
+      column_to_rownames('parameter') %>% 
+      t %>% 
+      as_tibble
+
+    if(ci_method == 'BCA') {
+      
+      mod_summ_tbl <- est_tbl %>% 
+        map(function(x) tibble(estimate = mean(x, na.rm = T), 
+                               lower_ci = bca(x[!is.na(x)])[1], 
+                               upper_ci = bca(x[!is.na(x)])[2]))
+      
+      
+    } else {
+      
+      mod_summ_tbl <- est_tbl %>% 
+        map(function(x) tibble(estimate = mean(x, na.rm = T), 
+                               lower_ci = quantile(x, 0.025, na.rm = T), 
+                               upper_ci = quantile(x, 0.975, na.rm = T)))
+      
+      
+    }
+    
+    mod_summ_tbl <- mod_summ_tbl %>% 
+      map2_dfr(., names(.), 
+               function(x, y) mutate(x, coefficient_name = y)) %>% 
+      mutate(covariate = stri_extract(coefficient_name, 
+                                      regex = extr_regex), 
+             covariate = ifelse(coefficient_name == '(Intercept)', 
+                                'Intercept', 
+                                covariate),
+             level = stri_replace_all(coefficient_name, 
+                                      regex = extr_regex, 
+                                      replacement = ''), 
+             level = ifelse(coefficient_name == '(Intercept)', 
+                            'Intercept', 
+                            level), 
+             response = response, 
+             n_complete = nrow(inp_tbl))
+    
+    ## calculation of the aggregated p values by the 'p value lottery' as described by http://arxiv.org/abs/1408.4026
+    
+    p_val_tbl <- ols_est %>% ## extracting t test p values for OLS estimates
+      compact %>% 
+      map(select, 
+          parameter, 
+          p_value) %>% 
+      map(mutate, 
+          p_value = p.adjust(p_value, 'BH')) %>% 
+      reduce(full_join, 
+             by = 'parameter') %>% 
+      column_to_rownames('parameter') %>% 
+      t %>% 
+      as_tibble
+    
+    p_val_tbl <- p_val_tbl %>% ## substituting the p values for the variables not selected in the particular split with 1
+      map_dfc(function(x) ifelse(is.na(x), 1, x))
+    
+    agg_p <- p_val_tbl %>% 
+      map(lotto_p_) %>% 
+      map2_dfr(., 
+               names(.), 
+               function(x, y) tibble(coefficient_name = y, 
+                                     p_aggreg = unlist(x)))
+    
+    mod_summ_tbl <- left_join(mod_summ_tbl, 
+                              agg_p, 
+                              by = 'coefficient_name')
+    
+    ## calculation of the p values via permutation test, i.e the fractions of OLS splits
+    ## where the estimate was greater or lower than 0, correction for multiple testing by 'BH' method
+    
+    sign_tbl <- mod_summ_tbl %>% 
+      mutate(est_sign = sign(estimate), 
+             est_boots = est_tbl %>% 
+               as.list) %>% 
+      select(coefficient_name, 
+             est_sign, 
+             est_boots)
+    
+    p_boot <- sign_tbl %>% 
+      select(est_sign, 
+             est_boots) %>% 
+      pmap_dbl(test_perm_)
+    
+    sign_tbl <- sign_tbl %>% 
+      mutate(p_boot = p_boot)
+    
+    mod_summ_tbl <- left_join(mod_summ_tbl, 
+                              sign_tbl[, c('coefficient_name', 'p_boot')], 
+                              by = 'coefficient_name')
+    
+    ## selecting the significant coefficient set
+    
+    final_var_set <- sign_tbl %>% 
+      filter(p_boot < 0.05) %>% 
+      .$coefficient_name
+  
+    ## the output list
+    
+    result_list <- list(response = response, 
+                        fit = NULL, 
+                        fit_measures = NULL, 
+                        fit_coef = mod_summ_tbl, 
+                        final_var_set = final_var_set) 
+    
+    message(paste('Elapsed:', 
+                  Sys.time() - start_time))
+
+    return(result_list)
+      
   }
   
 # END ------
