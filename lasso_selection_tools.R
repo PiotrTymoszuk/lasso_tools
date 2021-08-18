@@ -415,25 +415,14 @@
                                   family = family, 
                                   s = lambda_crit)
 
-    fit_rsq <- model_lasso(inp_tbl = new_data_tbl, 
-                           response = response, 
-                           variables = variables, 
-                           family = family, 
-                           alpha = alpha, 
-                           weights = weights)
-    
-    fit_rsq_tbl <- tibble(lambda = fit_rsq$lambda, 
-                          rsq = 1 - fit_rsq$dev.ratio) ## credits to: https://myweb.uiowa.edu/pbreheny/7600/s16/notes/2-22.pdf
-
     fit_measures$n <- nrow(new_data_tbl)
     
     attr(fit_measures$n, 'measure') = 'n observations'
-    
-    pseudo_rsq <- fit_rsq_tbl %>% 
-      filter(lambda >= cv_object[[lambda_crit]]) %>% 
+
+    fit_measures$rsq  <- tibble(lambda = cv_object$glmnet.fit$lambda, 
+                                rsq = 1 - cv_object$glmnet.fit$dev.ratio) %>% 
+      filter(lambda == cv_object[[lambda_crit]]) %>% 
       .$rsq
-    
-    fit_measures$rsq  <- pseudo_rsq[length(pseudo_rsq)]
     
     attr(fit_measures$rsq, 'measure') = 'pseudo R squared'
     
@@ -641,7 +630,7 @@
                                 variables = variables, 
                                 weights = weights, 
                                 family = family, 
-                                alpha = alpha)
+                                alpha = alpha, ...)
     
     ## getting the coeffcient values, variable names and their levels
     
