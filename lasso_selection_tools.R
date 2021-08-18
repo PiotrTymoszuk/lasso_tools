@@ -434,7 +434,7 @@
                                new_data_tbl, 
                                response, 
                                transf_fun = NULL, 
-                               variables = names(inp_tbl)[names(inp_tbl) != response], 
+                               variables = names(new_data_tbl)[names(new_data_tbl) != response], 
                                lambda_crit = 'lambda.1se', 
                                type = 'response', ...) {
     
