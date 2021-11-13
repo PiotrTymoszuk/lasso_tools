@@ -13,6 +13,7 @@
   require(coxed)
   require(stringi)
   require(hdi)
+  require(OptimalCutpoints)
 
 # globals -----
 
@@ -95,9 +96,10 @@
     ## table for plotting 
     
     data <- data %>% 
-      mutate(misslab = ifelse(.candidate_missfit == 'yes',
-                              .rownames, 
-                              NA))
+      mutate(misslab = try(ifelse(.candidate_missfit == 'yes',
+                                  .rownames, 
+                                  NA), silent = T),
+             misslab = ifelse(any(class(misslab) == 'try-error'), NA, misslab))
     
     ## fill colors
     
@@ -479,7 +481,7 @@
                                  new_data_tbl, 
                                  response, 
                                  transf_fun = NULL, 
-                                 variables = names(inp_tbl)[names(inp_tbl) != response], 
+                                 variables = names(new_data_tbl)[names(new_data_tbl) != response], 
                                  lambda_crit = 'lambda.1se', 
                                  type = 'response', ...) {
     
@@ -518,6 +520,85 @@
     return(qc_plots)
     
   }
+  
+  get_lasso_cv_stats <- function(lasso_modeling_list, 
+                                 lambda_crit = 'lambda.1se', 
+                                 cv = TRUE) {
+    
+    ## an upper level function.
+    ## retrieves cross-validation and re-distribution stats from a lasso modeling result list
+    
+    redist_tbl <- as_tibble(lasso_modeling_list$fit_measures)
+    
+    if(cv) {
+      
+      lambda_type <- stri_replace(lambda_crit, fixed = 'lambda.', replacement = '')
+      
+      md_fit <- lasso_modeling_list$fit
+      
+      lambda_index <- md_fit$index[lambda_type, 1]
+      
+      cv_tbl <- tibble(error_type = md_fit$name, 
+                       error_cv = md_fit$cvm[lambda_index], 
+                       error_cv_lower_ci = md_fit$cvlo[lambda_index], 
+                       error_cv_upper_ci = md_fit$cvup[lambda_index])
+      
+      redist_tbl <- as_tibble(cbind(redist_tbl, cv_tbl))
+      
+    }
+    
+    return(redist_tbl)
+    
+  } 
+  
+  get_lasso_pred_stats <- function(lasso_qc_tbl, family = 'binomial', tag.healthy = 0, ...) {
+    
+    ## calculates error measures based on the provided prediction table
+    
+    pred_tbl <- tibble(n = nrow(lasso_qc_tbl), 
+                       mse = 2 * mean((lasso_qc_tbl$y - lasso_qc_tbl$.fitted)^2, na.rm = TRUE), 
+                       mae = 2 * mean(abs(lasso_qc_tbl$y - lasso_qc_tbl$.fitted), na.rm = TRUE))
+    
+    if(family == 'binomial') {
+      
+      pred_tbl <- pred_tbl %>% 
+        mutate(n_cases = nrow(filter(lasso_qc_tbl, y == 1)))
+      
+      opt_cutpoint_obj <- optimal.cutpoints(.fitted ~ y, 
+                                            data = lasso_qc_tbl %>% 
+                                              mutate(.fitted = unname(.fitted)) %>% 
+                                              as.data.frame, 
+                                            methods = 'Youden', 
+                                            tag.healthy = tag.healthy, ...)
+      
+      opt_stats <- summary(opt_cutpoint_obj)
+      
+      cutpoint_stats <- opt_stats$p.table$Global$Youden %>% 
+        as.data.frame %>% 
+        t %>% 
+        as_tibble
+      
+      auc_stats <- opt_stats$p.table$Global$AUC_CI %>% 
+        stri_replace(., fixed = ",", replacement = '') %>% 
+        stri_replace(., fixed = '(', replacement = '') %>% 
+        stri_replace(., fixed = ')', replacement = '') %>%
+        stri_split(., fixed = ' ', simplify = T) %>% 
+        c
+      
+      cutpoint_stats <- cutpoint_stats %>% 
+        mutate(auc = as.numeric(auc_stats[1]), 
+               auc_lower_ci = as.numeric(auc_stats[2]), 
+               auc_upper_ci = as.numeric(auc_stats[3]))
+      
+      pred_tbl <- cbind(pred_tbl, cutpoint_stats) %>% 
+        as_tibble
+      
+    }
+    
+    return(pred_tbl)
+    
+  }
+  
   
 # bootstrap modeling function ------
   
